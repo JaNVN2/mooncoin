@@ -11,6 +11,9 @@ import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol
 /// @dev The pool contract is itself the ERC20 LP token, mirroring UniswapV2Pair. No admin,
 ///      fee-switch or pause exists; reserves are cached and only advance via _sync() so a
 ///      bare ETH/token donation cannot move price until a real interaction occurs.
+///      TWAP price accumulators (UniswapV2-style) are also maintained so a future contract can
+///      read a manipulation-resistant price without this pool needing to change; nothing in this
+///      repo consumes them yet.
 contract MoonEthPool is ERC20, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
@@ -18,11 +21,25 @@ contract MoonEthPool is ERC20, ReentrancyGuard {
     uint256 public constant FEE_NUMERATOR = 975;
     uint256 public constant FEE_DENOMINATOR = 1000;
     address public constant BURN_ADDRESS = address(0xdead);
+    uint256 private constant Q112 = 2 ** 112;
 
     IERC20 public immutable moon;
 
     uint256 public reserveMoon;
     uint256 public reserveEth;
+
+    /// @notice Cumulative sum of (reserveMoon/reserveEth), Q112.112 fixed point, weighted by seconds.
+    /// @dev Only advances in _sync(). Overflows mod 2**256 by design: an oracle consumer takes two
+    ///      checkpoints and divides `(cumulativeNow - cumulativeThen) / (timeNow - timeThen)`; the
+    ///      unchecked subtraction wraps correctly across an overflow the same way UniswapV2Pair's does.
+    uint256 public priceMoonCumulativeLast;
+
+    /// @notice Cumulative sum of (reserveEth/reserveMoon), Q112.112 fixed point, weighted by seconds.
+    /// @dev See {priceMoonCumulativeLast} for consumption and overflow semantics.
+    uint256 public priceEthCumulativeLast;
+
+    /// @notice Timestamp (mod 2**32) of the last _sync() call, for TWAP consumers to diff against.
+    uint32 public blockTimestampLast;
 
     error InvalidToken(address token);
     error InvalidRecipient(address recipient);
@@ -162,11 +179,30 @@ contract MoonEthPool is ERC20, ReentrancyGuard {
         emit Swap(msg.sender, moonIn, 0, 0, ethOut, to);
     }
 
-    function getReserves() external view returns (uint256 reserveMoon_, uint256 reserveEth_) {
-        return (reserveMoon, reserveEth);
+    function getReserves()
+        external
+        view
+        returns (uint256 reserveMoon_, uint256 reserveEth_, uint32 blockTimestampLast_)
+    {
+        return (reserveMoon, reserveEth, blockTimestampLast);
     }
 
+    /// @dev Accumulates TWAP price over the reserves that held for the elapsed period, using the
+    ///      pre-update reserves and timestamp, then refreshes reserves/timestamp from actual balances.
     function _sync() private {
+        uint256 cachedMoon = reserveMoon;
+        uint256 cachedEth = reserveEth;
+
+        uint32 blockTimestamp = uint32(block.timestamp % 2 ** 32);
+        unchecked {
+            uint32 timeElapsed = blockTimestamp - blockTimestampLast;
+            if (timeElapsed != 0 && cachedMoon != 0 && cachedEth != 0) {
+                priceMoonCumulativeLast += (cachedMoon * Q112 / cachedEth) * timeElapsed;
+                priceEthCumulativeLast += (cachedEth * Q112 / cachedMoon) * timeElapsed;
+            }
+        }
+        blockTimestampLast = blockTimestamp;
+
         reserveMoon = moon.balanceOf(address(this));
         reserveEth = address(this).balance;
         emit Sync(reserveMoon, reserveEth);
